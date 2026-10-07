@@ -6,7 +6,9 @@ type evaluator struct{}
 // evaluate 评估请求。语义：
 //   - 规则命中 = 角色匹配（含继承展开与 "*"）且动作匹配且资源匹配且条件满足；
 //   - 拒绝优先：任意一条拒绝规则命中即整体拒绝，与规则书写顺序无关；
-//   - 无任何允许规则命中时默认拒绝。
+//   - 无任何允许规则命中时默认拒绝；
+//   - 决定性规则：同一效果多条规则命中时，取规则 ID 字典序最小者，
+//     因此结论（含 RuleID）与规则书写顺序无关、可复现。
 func (e *evaluator) evaluate(p *Policy, req Request, version uint64) Decision {
 	effective := expandRoles(req.Roles, p.Roles)
 
@@ -26,10 +28,10 @@ func (e *evaluator) evaluate(p *Policy, req Request, version uint64) Decision {
 			continue
 		}
 		if r.Effect == EffectDeny {
-			if denyHit == nil {
+			if denyHit == nil || r.ID < denyHit.ID {
 				denyHit = r
 			}
-		} else if allowHit == nil {
+		} else if allowHit == nil || r.ID < allowHit.ID {
 			allowHit = r
 		}
 	}

@@ -40,10 +40,60 @@ d := e.Authorize(ctx, authz.Request{
 - **拒绝优先（deny-overrides）**：任意一条拒绝规则命中即整体拒绝
   （`ReasonExplicitDeny`），即使同时存在允许规则。结论只取决于规则集合，
   **与规则书写顺序无关**；多级继承与通配叠加的结果与逐条展开一致。
+- **决定性规则确定可复现**：同一效果有多条规则命中时，取规则 ID 字典序
+  最小者作为 `Decision.RuleID`。因此等价的策略无论规则书写顺序如何，
+  对同一请求给出的决定性规则完全一致。
 - **默认拒绝**：无任何允许规则命中时拒绝（`ReasonNoAllowRule`）。
 - **属性条件**：`eq` / `ne` / `in` / `glob`（`*`、`?` 通配）。
   属性缺失、类型不符或操作符未知一律视为条件不满足，不静默放行。
 - **可解释性**：`Decision` 携带决定性规则 ID、策略版本号与拒绝原因。
+
+## 外部属性依赖
+
+有些判断需要的属性请求方拿不到（如安全等级、资源归属），需要引擎
+自己向外部依赖获取。用法：
+
+```go
+// 1. 实现提供者（必须并发安全，应尊重 ctx 取消）
+type clearanceProvider struct{ /* ... */ }
+func (p *clearanceProvider) FetchAttributes(ctx context.Context, req authz.Request, attrs []string) (map[string]any, error) {
+    // 从用户中心/资源目录获取 attrs 列出的属性
+}
+
+// 2. 配置引擎
+e := authz.NewEngine(authz.WithAttributeProvider(&clearanceProvider{}))
+
+// 3. 策略中声明哪些属性来自外部依赖
+e.Publish(&authz.Policy{
+    ExternalAttributes: []string{"clearance"},
+    Rules: []authz.Rule{
+        {ID: "read-secret", Effect: authz.EffectAllow,
+         Roles: []string{"*"}, Actions: []string{"read"}, Resources: []string{"doc:secret"},
+         Condition: &authz.Condition{Attr: "clearance", Op: "eq", Value: "top"}},
+    },
+})
+```
+
+语义：
+
+- **按需获取**：仅当某条角色/动作/资源均匹配的规则，其条件引用了
+  `ExternalAttributes` 中声明的属性、且请求方未携带该属性时，才调用
+  `FetchAttributes`。请求方已携带的属性直接使用，不触发获取；
+  不声明 `ExternalAttributes` 的策略完全不涉及提供者，行为与之前一致。
+- **失败即拒绝**：获取报错、结果缺少必需属性、或未配置提供者而策略
+  需要外部属性时，直接拒绝并返回 `ReasonDependencyUnavailable`。
+  **该结论优先于任何允许规则**——只要评估必需的关键依赖没到位，
+  即使存在能匹配的允许规则也绝不放行。`Decision.RuleID` 记录被依赖
+  卡住的规则（多条时取 ID 字典序最小者）。
+- **单次评估一致性**：每次评估对必需属性只获取一次，整个评估使用同一份
+  结果，不会出现半新半旧的混合；不同请求的获取相互独立，结论不会串扰。
+- **失败不缓存**：`dependency_unavailable` 结论绝不写入缓存。依赖只是
+  暂时故障时，恢复后同一请求重新评估即可得到正常结论。
+- **取值即缓存键**：获取成功时，缓存键包含本次取到的外部属性值，
+  依赖取值变化后不会复用旧结论。
+- **时间预算**：获取与评估共享 `WithEvalTimeout` 预算。依赖慢或卡住时
+  按 `eval_timeout` 降级拒绝，请求不会无限等待；个别请求被拖住
+  不影响其它请求的评估。
 
 ## 版本与发布规则
 
@@ -66,16 +116,26 @@ d := e.Authorize(ctx, authz.Request{
 | 场景 | Reason |
 |---|---|
 | 从未发布过策略 | `policy_missing` |
-| 评估超时 / 上下文取消 | `eval_timeout` |
+| 评估超时 / 上下文取消 / 依赖卡住超预算 | `eval_timeout` |
+| 外部依赖获取失败、结果不完整或必需属性缺失 | `dependency_unavailable` |
 | 命中拒绝规则 | `explicit_deny` |
 | 无允许规则命中 | `no_allow_rule` |
+
+`dependency_unavailable` 表示评估**未能完成**（关键依赖没到位），
+与"评估完成但确实没权限"（`explicit_deny` / `no_allow_rule`）明确区分，
+监控与排障时可分别告警。该结论优先于允许、不写入缓存，依赖恢复后
+同一请求重新评估即得到正常结论。
 
 ## 配置项
 
 | Option | 默认值 | 说明 |
 |---|---|---|
-| `WithEvalTimeout(d)` | 100ms | 单次评估超时，超时降级拒绝 |
+| `WithEvalTimeout(d)` | 100ms | 单次评估超时（含外部属性获取），超时降级拒绝 |
 | `WithCacheSize(n)` | 1024 | 决策缓存容量上限 |
+| `WithAttributeProvider(p)` | 无 | 外部属性提供者；仅策略声明 `ExternalAttributes` 且请求方未携带对应属性时调用 |
+
+策略级配置：`Policy.ExternalAttributes` 声明需从外部依赖获取的属性名
+（发布时校验：非空、不重复）。不声明该字段的现有策略与配置无需任何迁移。
 
 ## 测试
 
@@ -84,5 +144,9 @@ go test ./authz/ -race -count=1
 ```
 
 覆盖：多级角色继承（含循环继承安全性）、属性条件、拒绝优先、
-规则顺序无关性（随机打乱 100 次）、并发发布与缓存失效、
-热更新一致性、超时与上下文取消降级、小容量缓存并发重建。
+规则顺序无关性（随机打乱 100 次，含决定性规则 RuleID 一致性）、
+并发发布与缓存失效、热更新一致性、超时与上下文取消降级、
+小容量缓存并发重建、外部依赖失败/不完整/未配置时拒绝且原因可区分、
+依赖缺失优先于允许规则、依赖恢复后结论恢复且失败不缓存、
+依赖取值变化不复用旧结论、并发与时好时坏依赖下结论与当次状态一致、
+依赖卡住时按预算降级且不阻塞其它请求。

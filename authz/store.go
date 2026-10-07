@@ -54,6 +54,16 @@ func (s *store) current() (p *Policy, version uint64, ok bool) {
 
 // validatePolicy 发布前校验，非法策略整体拒绝发布，不影响旧版本。
 func validatePolicy(p *Policy) error {
+	seen := make(map[string]struct{}, len(p.ExternalAttributes))
+	for _, a := range p.ExternalAttributes {
+		if a == "" {
+			return errors.New("authz: external attribute name must not be empty")
+		}
+		if _, dup := seen[a]; dup {
+			return fmt.Errorf("authz: duplicate external attribute %q", a)
+		}
+		seen[a] = struct{}{}
+	}
 	for i := range p.Rules {
 		r := &p.Rules[i]
 		if r.ID == "" {
