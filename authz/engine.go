@@ -20,6 +20,7 @@ type Engine struct {
 type engineConfig struct {
 	evalTimeout time.Duration
 	cacheSize   int
+	provider    AttributeProvider
 }
 
 // Option 配置项。
@@ -35,6 +36,13 @@ func WithCacheSize(n int) Option {
 	return func(c *engineConfig) { c.cacheSize = n }
 }
 
+// WithAttributeProvider 配置外部属性依赖。策略通过 Policy.ExternalAttrs
+// 声明需由引擎获取的属性；未配置本项而策略声明了外部属性时，
+// 涉及这些属性的评估一律按 ReasonDependencyUnavailable 降级拒绝。
+func WithAttributeProvider(p AttributeProvider) Option {
+	return func(c *engineConfig) { c.provider = p }
+}
+
 // NewEngine 创建引擎。
 func NewEngine(opts ...Option) *Engine {
 	cfg := engineConfig{evalTimeout: 100 * time.Millisecond, cacheSize: 1024}
@@ -44,7 +52,7 @@ func NewEngine(opts ...Option) *Engine {
 	return &Engine{
 		store:  newStore(),
 		cache:  newCache(cfg.cacheSize),
-		eval:   &evaluator{},
+		eval:   &evaluator{provider: cfg.provider},
 		config: cfg,
 	}
 }
@@ -82,14 +90,19 @@ func (e *Engine) Authorize(ctx context.Context, req Request) Decision {
 	type result struct{ d Decision }
 	ch := make(chan result, 1)
 	go func() {
-		ch <- result{d: e.eval.evaluate(policy, req, version)}
+		ch <- result{d: e.eval.evaluateCtx(ctx, policy, req, version)}
 	}()
 
 	t := time.NewTimer(e.config.evalTimeout)
 	defer t.Stop()
 	select {
 	case r := <-ch:
-		e.cache.put(version, key, r.d)
+		// 依赖不可用的降级结论不缓存：依赖是暂时性故障时，
+		// 恢复后同一请求必须能重新评估得到正常结论，
+		// 不能把一次失败永久记住。
+		if r.d.Reason != ReasonDependencyUnavailable {
+			e.cache.put(version, key, r.d)
+		}
 		return r.d
 	case <-ctx.Done():
 		return Decision{Allow: false, Reason: ReasonEvalTimeout, Version: version}

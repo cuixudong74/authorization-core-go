@@ -31,6 +31,10 @@ type Rule struct {
 type Policy struct {
 	Roles map[string][]string // 角色 -> 继承的父角色列表
 	Rules []Rule
+	// ExternalAttrs 声明请求方无法提供、需由引擎通过 AttributeProvider
+	// 从外部依赖获取的属性名。仅当某条候选规则（角色/动作/资源已匹配）
+	// 的条件引用这些属性时，评估才会真正发起获取。
+	ExternalAttrs []string
 }
 
 // Request 是一次授权询问。
@@ -51,6 +55,11 @@ const (
 	ReasonPolicyMissing DenyReason = "policy_missing" // 策略缺失，降级拒绝
 	ReasonEvalTimeout   DenyReason = "eval_timeout"   // 评估超时，降级拒绝
 	ReasonInvalidPolicy DenyReason = "invalid_policy" // 策略内容非法
+	// ReasonDependencyUnavailable 表示评估必需的外部依赖属性获取失败
+	// （Provider 报错、未配置 Provider 或返回值缺失）。此时评估未完成，
+	// 一律降级拒绝，且优先级高于任何允许规则；该结论不会被缓存，
+	// 依赖恢复后同一请求重新评估即可得到正常结论。
+	ReasonDependencyUnavailable DenyReason = "dependency_unavailable"
 )
 
 // Decision 是评估结论。
